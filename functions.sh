@@ -1,31 +1,39 @@
 # Define global functions
+
 # This function applies Dell's default dynamic fan control profile
 function apply_Dell_fan_control_profile() {
-  # Use ipmitool to send the raw command to set fan control to Dell default
   ipmitool -I $IDRAC_LOGIN_STRING raw 0x30 0x30 0x01 0x01 > /dev/null
   CURRENT_FAN_CONTROL_PROFILE="Dell default dynamic fan control profile"
 }
 
-# This function applies a user-specified static fan control profile
+# This function applies a user-specified static fan control profile with a given speed
 function apply_user_fan_control_profile() {
-  # Use ipmitool to send the raw command to set fan control to user-specified value
+  local speed=$1
+  local hex_speed=$(convert_decimal_value_to_hexadecimal $speed)
   ipmitool -I $IDRAC_LOGIN_STRING raw 0x30 0x30 0x01 0x00 > /dev/null
-  ipmitool -I $IDRAC_LOGIN_STRING raw 0x30 0x30 0x02 0xff $HEXADECIMAL_FAN_SPEED > /dev/null
-  CURRENT_FAN_CONTROL_PROFILE="User static fan control profile ($DECIMAL_FAN_SPEED%)"
+  ipmitool -I $IDRAC_LOGIN_STRING raw 0x30 0x30 0x02 0xff $hex_speed > /dev/null
+  CURRENT_FAN_CONTROL_PROFILE="User static fan control profile ($speed%)"
 }
 
-# Convert first parameter given ($DECIMAL_NUMBER) to hexadecimal
-# Usage : convert_decimal_value_to_hexadecimal $DECIMAL_NUMBER
-# Returns : hexadecimal value of DECIMAL_NUMBER
+# This function increases fan speed by a percentage and ensures it doesn't exceed 100%
+function increase_fan_speed() {
+  local increase=$1
+  local current_speed=$2
+  local new_speed=$((current_speed + increase))
+  if [ $new_speed -gt 100 ]; then
+    new_speed=100
+  fi
+  echo $new_speed
+}
+
+# Convert decimal to hexadecimal
 function convert_decimal_value_to_hexadecimal() {
   local -r DECIMAL_NUMBER=$1
   local -r HEXADECIMAL_NUMBER=$(printf '0x%02x' $DECIMAL_NUMBER)
   echo $HEXADECIMAL_NUMBER
 }
 
-# Convert first parameter given ($HEXADECIMAL_NUMBER) to decimal
-# Usage : convert_hexadecimal_value_to_decimal "$HEXADECIMAL_NUMBER"
-# Returns : decimal value of HEXADECIMAL_NUMBER
+# Convert hexadecimal to decimal
 function convert_hexadecimal_value_to_decimal() {
   local -r HEXADECIMAL_NUMBER=$1
   local -r DECIMAL_NUMBER=$(printf '%d' $HEXADECIMAL_NUMBER)
@@ -33,7 +41,6 @@ function convert_hexadecimal_value_to_decimal() {
 }
 
 # Retrieve temperature sensors data using ipmitool
-# Usage : retrieve_temperatures $IS_EXHAUST_TEMPERATURE_SENSOR_PRESENT $IS_CPU2_TEMPERATURE_SENSOR_PRESENT
 function retrieve_temperatures() {
   if (( $# != 2 )); then
     print_error "Illegal number of parameters.\nUsage: retrieve_temperatures \$IS_EXHAUST_TEMPERATURE_SENSOR_PRESENT \$IS_CPU2_TEMPERATURE_SENSOR_PRESENT"
@@ -64,69 +71,43 @@ function retrieve_temperatures() {
   fi
 }
 
-# /!\ Use this function only for Gen 13 and older generation servers /!\
+# For Gen 13 and older generation servers
 function enable_third_party_PCIe_card_Dell_default_cooling_response() {
-  # We could check the current cooling response before applying but it's not very useful so let's skip the test and apply directly
   ipmitool -I $IDRAC_LOGIN_STRING raw 0x30 0xce 0x00 0x16 0x05 0x00 0x00 0x00 0x05 0x00 0x00 0x00 0x00 > /dev/null
 }
 
-# /!\ Use this function only for Gen 13 and older generation servers /!\
+# For Gen 13 and older generation servers
 function disable_third_party_PCIe_card_Dell_default_cooling_response() {
-  # We could check the current cooling response before applying but it's not very useful so let's skip the test and apply directly
   ipmitool -I $IDRAC_LOGIN_STRING raw 0x30 0xce 0x00 0x16 0x05 0x00 0x00 0x00 0x05 0x00 0x01 0x00 0x00 > /dev/null
 }
-
-# Returns :
-# - 0 if third-party PCIe card Dell default cooling response is currently DISABLED
-# - 1 if third-party PCIe card Dell default cooling response is currently ENABLED
-# - 2 if the current status returned by ipmitool command output is unexpected
-# function is_third_party_PCIe_card_Dell_default_cooling_response_disabled() {
-#   THIRD_PARTY_PCIE_CARD_COOLING_RESPONSE=$(ipmitool -I $IDRAC_LOGIN_STRING raw 0x30 0xce 0x01 0x16 0x05 0x00 0x00 0x00)
-
-#   if [ "$THIRD_PARTY_PCIE_CARD_COOLING_RESPONSE" == "16 05 00 00 00 05 00 01 00 00" ]; then
-#     return 0
-#   elif [ "$THIRD_PARTY_PCIE_CARD_COOLING_RESPONSE" == "16 05 00 00 00 05 00 00 00 00" ]; then
-#     return 1
-#   else
-#     print_error "Unexpected output: $THIRD_PARTY_PCIE_CARD_COOLING_RESPONSE"
-#     return 2
-#   fi
-# }
 
 # Prepare traps in case of container exit
 function graceful_exit() {
   apply_Dell_fan_control_profile
-
-  # Reset third-party PCIe card cooling response to Dell default depending on the user's choice at startup
   if ! $KEEP_THIRD_PARTY_PCIE_CARD_COOLING_RESPONSE_STATE_ON_EXIT; then
     enable_third_party_PCIe_card_Dell_default_cooling_response
   fi
-
   print_warning_and_exit "Container stopped, Dell default dynamic fan control profile applied for safety"
 }
 
-# Helps debugging when people are posting their output
+# Get Dell server model
 function get_Dell_server_model() {
-  local -r IPMI_FRU_content=$(ipmitool -I $IDRAC_LOGIN_STRING fru 2>/dev/null) # FRU stands for "Field Replaceable Unit"
-
+  local -r IPMI_FRU_content=$(ipmitool -I $IDRAC_LOGIN_STRING fru 2>/dev/null)
   SERVER_MANUFACTURER=$(echo "$IPMI_FRU_content" | grep "Product Manufacturer" | awk -F ': ' '{print $2}')
   SERVER_MODEL=$(echo "$IPMI_FRU_content" | grep "Product Name" | awk -F ': ' '{print $2}')
-
-  # Check if SERVER_MANUFACTURER is empty, if yes, assign value based on "Board Mfg"
   if [ -z "$SERVER_MANUFACTURER" ]; then
     SERVER_MANUFACTURER=$(echo "$IPMI_FRU_content" | tr -s ' ' | grep "Board Mfg :" | awk -F ': ' '{print $2}')
   fi
-
-  # Check if SERVER_MODEL is empty, if yes, assign value based on "Board Product"
   if [ -z "$SERVER_MODEL" ]; then
     SERVER_MODEL=$(echo "$IPMI_FRU_content" | tr -s ' ' | grep "Board Product :" | awk -F ': ' '{print $2}')
   fi
 }
 
-# Define functions to check if CPU 1 and CPU 2 temperatures are above the threshold
+# Define functions to check if CPU temperatures are above the threshold
 function CPU1_OVERHEATING() { [ $CPU1_TEMPERATURE -gt $CPU_TEMPERATURE_THRESHOLD ]; }
 function CPU2_OVERHEATING() { [ $CPU2_TEMPERATURE -gt $CPU_TEMPERATURE_THRESHOLD ]; }
 
+# Error and warning functions
 function print_error() {
   local -r ERROR_MESSAGE="$1"
   printf "/!\ Error /!\ %s." "$ERROR_MESSAGE" >&2
