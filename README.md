@@ -4,16 +4,36 @@
 
 ## Table of contents
 <ol>
+  <li><a href="#features">Features</a></li>
   <li><a href="#container-console-log-example">Container console log example</a></li>
   <li><a href="#requirements">Requirements</a></li>
   <li><a href="#supported-architectures">Supported architectures</a></li>
   <li><a href="#download-docker-image">Download Docker image</a></li>
   <li><a href="#usage">Usage</a></li>
   <li><a href="#parameters">Parameters</a></li>
+  <li><a href="#stepped-fan-control">Stepped Fan Control Explained</a></li>
   <li><a href="#troubleshooting">Troubleshooting</a></li>
   <li><a href="#contributing">Contributing</a></li>
   <li><a href="#license">License</a></li>
 </ol>
+
+<!-- FEATURES -->
+## Features
+
+This Docker container allows you to control Dell PowerEdge server fans via IPMI, replacing the default loud Dell fan control with a quieter custom profile.
+
+### Core Features
+- **Static fan speed control**: Set a fixed low fan speed for noise reduction
+- **Stepped fan control**: Automatically adjusts fan speed based on CPU temperature in stepped increments
+- **iDRAC reconnection**: Gracefully handles network interruptions without crashing
+- **Third-party PCIe card support**: Optional control for non-Dell PCIe cards
+- **Emergency fallback**: Automatically reverts to Dell default fan control if CPU overheats
+
+### What's New (Fork Enhancements)
+- **Stepped Fan Control**: Instead of incrementally increasing fan speed, the controller now calculates the target speed based on current temperature. When temperature decreases, fan speed automatically decreases to the appropriate step - no waiting for it to drop below threshold.
+- **iDRAC Reconnection**: Network issues with iDRAC will no longer crash the container. The controller retries failed commands and continues operating when connectivity is restored.
+
+<p align="right">(<a href="#top">back to top</a>)</p>
 
 ## Container console log example
 
@@ -73,24 +93,24 @@ This Docker container is currently built and available for the following CPU arc
 <!-- USAGE -->
 ## Usage
 
-1. with local iDRAC:
+### Quick Start
 
+1. With local iDRAC:
 ```bash
 docker run -d \
   --name Dell_iDRAC_fan_controller \
   --restart=unless-stopped \
   -e IDRAC_HOST=local \
-  -e FAN_SPEED=<decimal or hexadecimal fan speed> \
-  -e CPU_TEMPERATURE_THRESHOLD=<decimal temperature threshold> \
-  -e CHECK_INTERVAL=<seconds between each check> \
-  -e DISABLE_THIRD_PARTY_PCIE_CARD_DELL_DEFAULT_COOLING_RESPONSE=<true or false> \
-  -e KEEP_THIRD_PARTY_PCIE_CARD_COOLING_RESPONSE_STATE_ON_EXIT=<true or false> \
+  -e FAN_SPEED=10 \
+  -e CPU_TEMPERATURE_THRESHOLD=60 \
+  -e CPU_TEMPERATURE_THRESHOLD_MAX=80 \
+  -e FAN_STEP=20 \
+  -e CHECK_INTERVAL=30 \
   --device=/dev/ipmi0:/dev/ipmi0:rw \
   tigerblue77/dell_idrac_fan_controller:latest
 ```
 
-2. with LAN iDRAC:
-
+2. With LAN iDRAC:
 ```bash
 docker run -d \
   --name Dell_iDRAC_fan_controller \
@@ -98,18 +118,17 @@ docker run -d \
   -e IDRAC_HOST=<iDRAC IP address> \
   -e IDRAC_USERNAME=<iDRAC username> \
   -e IDRAC_PASSWORD=<iDRAC password> \
-  -e FAN_SPEED=<decimal or hexadecimal fan speed> \
-  -e CPU_TEMPERATURE_THRESHOLD=<decimal temperature threshold> \
-  -e CHECK_INTERVAL=<seconds between each check> \
-  -e DISABLE_THIRD_PARTY_PCIE_CARD_DELL_DEFAULT_COOLING_RESPONSE=<true or false> \
-  -e KEEP_THIRD_PARTY_PCIE_CARD_COOLING_RESPONSE_STATE_ON_EXIT=<true or false> \
+  -e FAN_SPEED=10 \
+  -e CPU_TEMPERATURE_THRESHOLD=60 \
+  -e CPU_TEMPERATURE_THRESHOLD_MAX=80 \
+  -e FAN_STEP=20 \
+  -e CHECK_INTERVAL=30 \
   tigerblue77/dell_idrac_fan_controller:latest
 ```
 
-`docker-compose.yml` examples:
+### Docker Compose Examples
 
-1. to use with local iDRAC:
-
+#### Quiet Home Server (Recommended)
 ```yml
 version: '3.8'
 
@@ -120,17 +139,18 @@ services:
     restart: unless-stopped
     environment:
       - IDRAC_HOST=local
-      - FAN_SPEED=<decimal or hexadecimal fan speed>
-      - CPU_TEMPERATURE_THRESHOLD=<decimal temperature threshold>
-      - CHECK_INTERVAL=<seconds between each check>
-      - DISABLE_THIRD_PARTY_PCIE_CARD_DELL_DEFAULT_COOLING_RESPONSE=<true or false>
-      - KEEP_THIRD_PARTY_PCIE_CARD_COOLING_RESPONSE_STATE_ON_EXIT=<true or false>
+      - FAN_SPEED=10
+      - CPU_TEMPERATURE_THRESHOLD=60
+      - CPU_TEMPERATURE_THRESHOLD_MAX=80
+      - FAN_STEP=5
+      - CHECK_INTERVAL=30
+      - IDRAC_RETRY_COUNT=3
+      - IDRAC_RETRY_DELAY=5
     devices:
       - /dev/ipmi0:/dev/ipmi0:rw
 ```
 
-2. to use with LAN iDRAC:
-
+#### Aggressive Cooling
 ```yml
 version: '3.8'
 
@@ -143,11 +163,13 @@ services:
       - IDRAC_HOST=<iDRAC IP address>
       - IDRAC_USERNAME=<iDRAC username>
       - IDRAC_PASSWORD=<iDRAC password>
-      - FAN_SPEED=<decimal or hexadecimal fan speed>
-      - CPU_TEMPERATURE_THRESHOLD=<decimal temperature threshold>
-      - CHECK_INTERVAL=<seconds between each check>
-      - DISABLE_THIRD_PARTY_PCIE_CARD_DELL_DEFAULT_COOLING_RESPONSE=<true or false>
-      - KEEP_THIRD_PARTY_PCIE_CARD_COOLING_RESPONSE_STATE_ON_EXIT=<true or false>
+      - FAN_SPEED=15
+      - CPU_TEMPERATURE_THRESHOLD=55
+      - CPU_TEMPERATURE_THRESHOLD_MAX=75
+      - FAN_STEP=3
+      - CHECK_INTERVAL=20
+    devices:
+      - /dev/ipmi0:/dev/ipmi0:rw
 ```
 
 <p align="right">(<a href="#top">back to top</a>)</p>
@@ -155,16 +177,93 @@ services:
 <!-- PARAMETERS -->
 ## Parameters
 
-All parameters are optional as they have default values (including default iDRAC username and password).
+All parameters are optional as they have default values.
 
-- `IDRAC_HOST` parameter can be set to "local" or to your distant iDRAC's IP address. **Default** value is "local".
-- `IDRAC_USERNAME` parameter is only necessary if you're adressing a distant iDRAC. **Default** value is "root".
-- `IDRAC_PASSWORD` parameter is only necessary if you're adressing a distant iDRAC. **Default** value is "calvin".
-- `FAN_SPEED` parameter can be set as a decimal (from 0 to 100%) or hexadecimaladecimal value (from 0x00 to 0x64) you want to set the fans to. **Default** value is 5(%).
-- `CPU_TEMPERATURE_THRESHOLD` parameter is the T°junction (junction temperature) threshold beyond which the Dell fan mode defined in your BIOS will become active again (to protect the server hardware against overheat). **Default** value is 50(°C).
-- `CHECK_INTERVAL` parameter is the time (in seconds) between each temperature check and potential profile change. **Default** value is 60(s).
-- `DISABLE_THIRD_PARTY_PCIE_CARD_DELL_DEFAULT_COOLING_RESPONSE` parameter is a boolean that allows to disable third-party PCIe card Dell default cooling response. **Default** value is false.
-- `KEEP_THIRD_PARTY_PCIE_CARD_COOLING_RESPONSE_STATE_ON_EXIT` parameter is a boolean that allows to keep the third-party PCIe card Dell default cooling response state upon exit. **Default** value is false, so that it resets the third-party PCIe card Dell default cooling response to Dell default.
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `IDRAC_HOST` | `local` | iDRAC connection: `local` or IP address |
+| `IDRAC_USERNAME` | `root` | iDRAC username (for LAN connection) |
+| `IDRAC_PASSWORD` | `calvin` | iDRAC password (for LAN connection) |
+| `FAN_SPEED` | `10` | Base fan speed (%) when below temperature threshold |
+| `CPU_TEMPERATURE_THRESHOLD` | `60` | Temperature (°C) to start stepped fan control |
+| `CPU_TEMPERATURE_THRESHOLD_MAX` | `80` | Temperature (°C) to trigger emergency Dell default mode |
+| `FAN_STEP` | `20` | Temperature step size (°C) for each fan speed increment |
+| `CHECK_INTERVAL` | `30` | Seconds between temperature checks |
+| `DISABLE_THIRD_PARTY_PCIE_CARD_DELL_DEFAULT_COOLING_RESPONSE` | `false` | Disable Dell cooling for third-party PCIe cards |
+| `KEEP_THIRD_PARTY_PCIE_CARD_COOLING_RESPONSE_STATE_ON_EXIT` | `false` | Keep PCIe cooling state when container stops |
+| `IDRAC_RETRY_COUNT` | `3` | Number of retries when iDRAC command fails |
+| `IDRAC_RETRY_DELAY` | `5` | Seconds to wait between iDRAC retries |
+
+<p align="right">(<a href="#top">back to top</a>)</p>
+
+<!-- STEPPED FAN CONTROL -->
+## Stepped Fan Control Explained
+
+### How It Works
+
+Instead of incrementally increasing fan speed each cycle (which can cause overshoot), stepped control calculates the target speed based on the **current temperature**:
+
+```
+Temperature → Determine Step → Calculate Speed → Apply
+```
+
+### Speed Calculation
+
+```
+Speed = FAN_SPEED + (step_number × speed_per_step)
+
+Where:
+  step_number = floor((current_temp - THRESHOLD) / FAN_STEP)
+  speed_per_step = (100 - FAN_SPEED) / max_steps
+  max_steps = ceil((THRESHOLD_MAX - THRESHOLD) / FAN_STEP)
+```
+
+### Example
+
+**Configuration:**
+- `FAN_SPEED = 10`
+- `FAN_STEP = 20`
+- `CPU_TEMPERATURE_THRESHOLD = 60`
+- `CPU_TEMPERATURE_THRESHOLD_MAX = 80`
+
+**Result:**
+
+| CPU Temperature | Fan Speed | Status |
+|-----------------|-----------|--------|
+| < 60°C | 10% | Quiet, base speed |
+| 60-80°C | 10-100% | Stepped increase |
+| >= 80°C | Dell Default | Emergency mode |
+
+With `FAN_STEP=5` for finer control:
+
+| CPU Temperature | Fan Speed |
+|-----------------|-----------|
+| < 60°C | 10% |
+| 60-65°C | ~30% |
+| 65-70°C | ~50% |
+| 70-75°C | ~70% |
+| 75-80°C | ~90% |
+| >= 80°C | Dell Default |
+
+### Configuration Guide
+
+| Use Case | FAN_STEP | FAN_SPEED | Notes |
+|----------|----------|-----------|-------|
+| Silent home server | 5-10 | 5-10 | Smoother transitions, quieter |
+| Default | 20 | 10 | Balanced |
+| Performance | 3-5 | 15-20 | Faster response |
+
+### Why Stepped Control?
+
+**Problem with incremental control:**
+- Temperature at 65°C → Fan 30%
+- Temperature drops to 62°C → Fan still 30% (must stay below threshold to reset)
+- Result: Unnecessarily high fan speed for longer
+
+**Stepped control advantage:**
+- Temperature at 70°C → Fan 50%
+- Temperature drops to 67°C → Fan automatically drops to 30%
+- No waiting for threshold - automatic adjustment
 
 <p align="right">(<a href="#top">back to top</a>)</p>
 
@@ -179,6 +278,15 @@ All parameters are optional as they have default values (including default iDRAC
 ### You get `/!\ Your server isn't a Dell product. Exiting.` error on UnRAID OS
 
 - Run the image using usual `docker run` command instead of UnRAID Community Apps or Docker UI. [More informations here.](https://github.com/tigerblue77/Dell_iDRAC_fan_controller_Docker/issues/89#issuecomment-4166458799)
+
+### Container keeps retrying and logging warnings
+
+This is expected behavior when the iDRAC is temporarily unreachable (network issues). The container will automatically resume normal operation when connectivity is restored. Adjust `IDRAC_RETRY_COUNT` and `IDRAC_RETRY_DELAY` if needed.
+
+### Fan speed seems too high/too low
+
+- For quieter operation: decrease `FAN_SPEED`, increase `FAN_STEP`
+- For faster cooling response: increase `FAN_SPEED`, decrease `FAN_STEP`
 
 <p align="right">(<a href="#top">back to top</a>)</p>
 
@@ -208,12 +316,21 @@ export IDRAC_USERNAME=<iDRAC username>
 export IDRAC_PASSWORD=<iDRAC password>
 export FAN_SPEED=<decimal or hexadecimal fan speed>
 export CPU_TEMPERATURE_THRESHOLD=<decimal temperature threshold>
+export CPU_TEMPERATURE_THRESHOLD_MAX=<maximum temperature threshold>
+export FAN_STEP=<temperature step size>
 export CHECK_INTERVAL=<seconds between each check>
+export IDRAC_RETRY_COUNT=<number of retries>
+export IDRAC_RETRY_DELAY=<retry delay seconds>
 export DISABLE_THIRD_PARTY_PCIE_CARD_DELL_DEFAULT_COOLING_RESPONSE=<true or false>
 export KEEP_THIRD_PARTY_PCIE_CARD_COOLING_RESPONSE_STATE_ON_EXIT=<true or false>
 
 chmod +x Dell_iDRAC_fan_controller.sh
 ./Dell_iDRAC_fan_controller.sh
+```
+
+### Running Tests
+```bash
+bats tests/
 ```
 
 <p align="right">(<a href="#top">back to top</a>)</p>
