@@ -41,6 +41,89 @@ function convert_hexadecimal_value_to_decimal() {
   echo $DECIMAL_NUMBER
 }
 
+# Calculate target fan speed based on temperature
+# Usage: calculate_target_fan_speed $cpu_temp $threshold $threshold_max
+# Returns: fan speed percentage (0-100), empty if emergency (above max)
+function calculate_target_fan_speed() {
+  local cpu_temp=$1
+  local threshold=$2
+  local threshold_max=$3
+
+  # Below threshold - use base fan speed
+  if [ "$cpu_temp" -lt "$threshold" ]; then
+    echo "$DECIMAL_FAN_SPEED"
+    return
+  fi
+
+  # Above max threshold - signal emergency (caller should apply Dell default)
+  if [ "$cpu_temp" -ge "$threshold_max" ]; then
+    echo ""
+    return
+  fi
+
+  # Calculate how many steps we're into the range
+  local temp_range=$((threshold_max - threshold))
+
+  # Avoid division by zero (shouldn't happen if threshold_max > threshold)
+  if [ "$temp_range" -le 0 ]; then
+    echo "100"
+    return
+  fi
+
+  # Calculate step progress
+  local temp_offset=$((cpu_temp - threshold))
+  local step_count=$((temp_offset / FAN_STEP))
+  local max_steps=$(((temp_range + FAN_STEP - 1) / FAN_STEP))  # Round up
+
+  # Calculate target speed: base + (step_count * speed_per_step)
+  local speed_range=$((100 - DECIMAL_FAN_SPEED))
+  local speed_per_step=$((speed_range / max_steps))
+  local target_speed=$((DECIMAL_FAN_SPEED + step_count * speed_per_step))
+
+  # Cap at 100
+  if [ "$target_speed" -gt 100 ]; then
+    target_speed=100
+  fi
+
+  echo "$target_speed"
+}
+
+# Check if iDRAC is reachable
+# Returns: 0 if reachable, 1 if not
+function is_iDRAC_reachable() {
+  # Quick check using ipmitool sensor list (faster than full command)
+  timeout 5 ipmitool -I $IDRAC_LOGIN_STRING sensor list 1 > /dev/null 2>&1
+  return $?
+}
+
+# Execute command with retry logic
+# Usage: execute_with_retry max_retries delay_seconds "command args..."
+# Returns: 0 on success, 1 on all retries failed
+# Output: Captures command output on success
+function execute_with_retry() {
+  local max_retries=$1
+  local delay=$2
+  shift 2
+  local cmd="$*"
+
+  local attempt=1
+  while [ $attempt -le $max_retries ]; do
+    if eval "$cmd" > /dev/null 2>&1; then
+      eval "$cmd"  # Re-run to capture actual output
+      return 0
+    fi
+
+    if [ $attempt -lt $max_retries ]; then
+      print_warning "iDRAC command failed (attempt $attempt/$max_retries), retrying in ${delay}s..."
+      sleep "$delay"
+    fi
+    ((attempt++))
+  done
+
+  print_error "iDRAC command failed after $max_retries attempts"
+  return 1
+}
+
 # Set the IDRAC_LOGIN_STRING variable based on connection type
 # Usage : set_iDRAC_login_string $IDRAC_HOST $IDRAC_USERNAME $IDRAC_PASSWORD
 # Returns : IDRAC_LOGIN_STRING
