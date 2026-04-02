@@ -5,6 +5,7 @@
 # set -euo pipefail
 
 source functions.sh
+source constants.sh
 
 # Trap the signals for container exit and run graceful_exit function
 trap 'graceful_exit' SIGINT SIGQUIT SIGTERM
@@ -16,28 +17,19 @@ FAN_SPEED_INCREASE_PERCENTAGE=${FAN_SPEED_INCREASE_PERCENTAGE:-10}  # Default to
 CPU_TEMPERATURE_THRESHOLD_MAX=${CPU_TEMPERATURE_THRESHOLD_MAX:-80}  # Default to 80°C if not set
 
 # Check if FAN_SPEED variable is in hexadecimal format. If not, convert it to hexadecimal
-if [[ $FAN_SPEED == 0x* ]]; then
+if [[ "$FAN_SPEED" == 0x* ]]; then
   readonly DECIMAL_FAN_SPEED=$(convert_hexadecimal_value_to_decimal "$FAN_SPEED")
-  readonly HEXADECIMAL_FAN_SPEED=$FAN_SPEED
+  readonly HEXADECIMAL_FAN_SPEED="$FAN_SPEED"
 else
-  readonly DECIMAL_FAN_SPEED=$FAN_SPEED
+  readonly DECIMAL_FAN_SPEED="$FAN_SPEED"
   readonly HEXADECIMAL_FAN_SPEED=$(convert_decimal_value_to_hexadecimal "$FAN_SPEED")
 fi
 
 # Initialize CURRENT_FAN_SPEED to the preset fan speed
 CURRENT_FAN_SPEED=$DECIMAL_FAN_SPEED
 
-# Check if the iDRAC host is set to 'local' or not then set the IDRAC_LOGIN_STRING accordingly
-if [[ $IDRAC_HOST == "local" ]]; then
-  if [ ! -e "/dev/ipmi0" ] && [ ! -e "/dev/ipmi/0" ] && [ ! -e "/dev/ipmidev/0" ]; then
-    print_error_and_exit "Could not open device at /dev/ipmi0 or /dev/ipmi/0 or /dev/ipmidev/0, check that you added the device to your Docker container or stop using local mode"
-  fi
-  IDRAC_LOGIN_STRING='open'
-else
-  echo "iDRAC/IPMI username: $IDRAC_USERNAME"
-  #echo "iDRAC/IPMI password: $IDRAC_PASSWORD"
-  IDRAC_LOGIN_STRING="lanplus -H $IDRAC_HOST -U $IDRAC_USERNAME -P $IDRAC_PASSWORD"
-fi
+# Set the IDRAC_LOGIN_STRING using the function
+set_iDRAC_login_string "$IDRAC_HOST" "$IDRAC_USERNAME" "$IDRAC_PASSWORD"
 
 get_Dell_server_model
 
@@ -66,11 +58,9 @@ echo "CPU temperature max threshold: $CPU_TEMPERATURE_THRESHOLD_MAX°C"
 echo "Check interval: ${CHECK_INTERVAL}s"
 echo ""
 
-# Define the interval for printing
-readonly TABLE_HEADER_PRINT_INTERVAL=10
-i=$TABLE_HEADER_PRINT_INTERVAL
+TABLE_HEADER_PRINT_COUNTER=$TABLE_HEADER_PRINT_INTERVAL
 # Set the flag used to check if the active fan control profile has changed
-IS_DELL_FAN_CONTROL_PROFILE_APPLIED=true
+IS_DELL_DEFAULT_FAN_CONTROL_PROFILE_APPLIED=true
 
 # Check present sensors
 IS_EXHAUST_TEMPERATURE_SENSOR_PRESENT=true
@@ -88,21 +78,42 @@ if ! $IS_EXHAUST_TEMPERATURE_SENSOR_PRESENT || ! $IS_CPU2_TEMPERATURE_SENSOR_PRE
   echo ""
 fi
 
+#readonly NUMBER_OF_DETECTED_CPUS=(${CPUS_TEMPERATURES//;/ })
+# TODO : write "X CPU sensors detected." and remove previous ifs
+readonly HEADER=$(build_header $NUMBER_OF_DETECTED_CPUS)
+
 # Start monitoring
 while true; do
   # Sleep for the specified interval before taking another reading
-  sleep $CHECK_INTERVAL &
+  sleep "$CHECK_INTERVAL" &
   SLEEP_PROCESS_PID=$!
 
   retrieve_temperatures $IS_EXHAUST_TEMPERATURE_SENSOR_PRESENT $IS_CPU2_TEMPERATURE_SENSOR_PRESENT
 
   # Initialize a variable to store the comments displayed when the fan control profile changed
   COMMENT=" -"
-  if [ $CPU1_TEMPERATURE -ge $CPU_TEMPERATURE_THRESHOLD_MAX ] || ($IS_CPU2_TEMPERATURE_SENSOR_PRESENT && [ $CPU2_TEMPERATURE -ge $CPU_TEMPERATURE_THRESHOLD_MAX ]); then
-    apply_Dell_fan_control_profile
-    if ! $IS_DELL_FAN_CONTROL_PROFILE_APPLIED; then
-      IS_DELL_FAN_CONTROL_PROFILE_APPLIED=true
-      COMMENT="CPU temperature reached max threshold, Dell default dynamic fan control profile applied for safety"
+  # Check if CPU 1 is overheating then apply Dell default dynamic fan control profile if true
+  if CPU1_OVERHEATING; then
+    apply_Dell_default_fan_control_profile
+
+    if ! $IS_DELL_DEFAULT_FAN_CONTROL_PROFILE_APPLIED; then
+      IS_DELL_DEFAULT_FAN_CONTROL_PROFILE_APPLIED=true
+
+      # If CPU 2 temperature sensor is present, check if it is overheating too.
+      # Do not apply Dell default dynamic fan control profile as it has already been applied before
+      if $IS_CPU2_TEMPERATURE_SENSOR_PRESENT && CPU2_OVERHEATING; then
+        COMMENT="CPU 1 and CPU 2 temperatures are too high, Dell default dynamic fan control profile applied for safety"
+      else
+        COMMENT="CPU 1 temperature is too high, Dell default dynamic fan control profile applied for safety"
+      fi
+    fi
+  # If CPU 2 temperature sensor is present, check if it is overheating then apply Dell default dynamic fan control profile if true
+  elif $IS_CPU2_TEMPERATURE_SENSOR_PRESENT && CPU2_OVERHEATING; then
+    apply_Dell_default_fan_control_profile
+
+    if ! $IS_DELL_DEFAULT_FAN_CONTROL_PROFILE_APPLIED; then
+      IS_DELL_DEFAULT_FAN_CONTROL_PROFILE_APPLIED=true
+      COMMENT="CPU 2 temperature is too high, Dell default dynamic fan control profile applied for safety"
     fi
   elif [ $CPU1_TEMPERATURE -ge $CPU_TEMPERATURE_THRESHOLD ] || ($IS_CPU2_TEMPERATURE_SENSOR_PRESENT && [ $CPU2_TEMPERATURE -ge $CPU_TEMPERATURE_THRESHOLD ]); then
     # Increase fan speed
@@ -113,15 +124,17 @@ while true; do
     # Reset to default fan speed
     CURRENT_FAN_SPEED=$DECIMAL_FAN_SPEED
     apply_user_fan_control_profile $CURRENT_FAN_SPEED
-    if $IS_DELL_FAN_CONTROL_PROFILE_APPLIED; then
-      IS_DELL_FAN_CONTROL_PROFILE_APPLIED=false
+    if $IS_DELL_DEFAULT_FAN_CONTROL_PROFILE_APPLIED; then
+      IS_DELL_DEFAULT_FAN_CONTROL_PROFILE_APPLIED=false
       COMMENT="CPU temperature decreased and is now OK (<= $CPU_TEMPERATURE_THRESHOLD°C), user's fan control profile applied."
     fi
   fi
 
-  # If server model is Gen 14 (*40) or newer
+  # If server model is not Gen 14 (*40) or newer
   if ! $DELL_POWEREDGE_GEN_14_OR_NEWER; then
-    if $DISABLE_THIRD_PARTY_PCIE_CARD_DELL_DEFAULT_COOLING_RESPONSE; then
+    # Enable or disable, depending on the user's choice, third-party PCIe card Dell default cooling response
+    # No comment will be displayed on the change of this parameter since it is not related to the temperature of any device (CPU, GPU, etc...) but only to the settings made by the user when launching this Docker container
+    if "$DISABLE_THIRD_PARTY_PCIE_CARD_DELL_DEFAULT_COOLING_RESPONSE"; then
       disable_third_party_PCIe_card_Dell_default_cooling_response
       THIRD_PARTY_PCIE_CARD_DELL_DEFAULT_COOLING_RESPONSE_STATUS="Disabled"
     else
@@ -131,12 +144,11 @@ while true; do
   fi
 
   # Print temperatures, active fan control profile and comment if any change happened during last time interval
-  if [ $i -eq $TABLE_HEADER_PRINT_INTERVAL ]; then
-    echo "                     ------- Temperatures -------"
-    echo "    Date & time      Inlet  CPU 1  CPU 2  Exhaust          Active fan speed profile          Third-party PCIe card Dell default cooling response  Comment"
-    i=0
+  if [ $TABLE_HEADER_PRINT_COUNTER -eq $TABLE_HEADER_PRINT_INTERVAL ]; then
+    printf "%s\n" "$HEADER"
+    TABLE_HEADER_PRINT_COUNTER=0
   fi
-  printf "%19s  %3d°C  %3d°C  %3s°C  %5s°C  %40s  %51s  %s\n" "$(date +"%d-%m-%Y %T")" $INLET_TEMPERATURE $CPU1_TEMPERATURE "$CPU2_TEMPERATURE" "$EXHAUST_TEMPERATURE" "$CURRENT_FAN_CONTROL_PROFILE" "$THIRD_PARTY_PCIE_CARD_DELL_DEFAULT_COOLING_RESPONSE_STATUS" "$COMMENT"
-  ((i++))
+  print_temperature_array_line "$INLET_TEMPERATURE" "$CPUS_TEMPERATURES" "$EXHAUST_TEMPERATURE" "$CURRENT_FAN_CONTROL_PROFILE" "$THIRD_PARTY_PCIE_CARD_DELL_DEFAULT_COOLING_RESPONSE_STATUS" "$COMMENT"
+  ((TABLE_HEADER_PRINT_COUNTER++))
   wait $SLEEP_PROCESS_PID
 done
