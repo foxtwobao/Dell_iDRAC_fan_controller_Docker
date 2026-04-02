@@ -13,8 +13,15 @@ trap 'graceful_exit' SIGINT SIGQUIT SIGTERM
 # Prepare, format and define initial variables
 
 # Read new parameters from environment variables with defaults
-FAN_SPEED_INCREASE_PERCENTAGE=${FAN_SPEED_INCREASE_PERCENTAGE:-10}  # Default to 10% if not set
-CPU_TEMPERATURE_THRESHOLD_MAX=${CPU_TEMPERATURE_THRESHOLD_MAX:-80}  # Default to 80°C if not set
+FAN_STEP=${FAN_STEP:-$DEFAULT_FAN_STEP}
+CPU_TEMPERATURE_THRESHOLD_MAX=${CPU_TEMPERATURE_THRESHOLD_MAX:-80}
+IDRAC_RETRY_COUNT=${IDRAC_RETRY_COUNT:-$DEFAULT_IDRAC_RETRY_COUNT}
+IDRAC_RETRY_DELAY=${IDRAC_RETRY_DELAY:-$DEFAULT_IDRAC_RETRY_DELAY}
+
+# Make these readonly after reading
+readonly FAN_STEP
+readonly IDRAC_RETRY_COUNT
+readonly IDRAC_RETRY_DELAY
 
 # Check if FAN_SPEED variable is in hexadecimal format. If not, convert it to hexadecimal
 if [[ "$FAN_SPEED" == 0x* ]]; then
@@ -31,7 +38,9 @@ CURRENT_FAN_SPEED=$DECIMAL_FAN_SPEED
 # Set the IDRAC_LOGIN_STRING using the function
 set_iDRAC_login_string "$IDRAC_HOST" "$IDRAC_USERNAME" "$IDRAC_PASSWORD"
 
-get_Dell_server_model
+if ! execute_with_retry $IDRAC_RETRY_COUNT $IDRAC_RETRY_DELAY "get_Dell_server_model"; then
+  print_error_and_exit "Failed to get Dell server model from iDRAC after $IDRAC_RETRY_COUNT retries"
+fi
 
 if [[ ! $SERVER_MANUFACTURER == "DELL" ]]; then
   print_error_and_exit "Your server isn't a Dell product"
@@ -88,46 +97,48 @@ while true; do
   sleep "$CHECK_INTERVAL" &
   SLEEP_PROCESS_PID=$!
 
-  retrieve_temperatures $IS_EXHAUST_TEMPERATURE_SENSOR_PRESENT $IS_CPU2_TEMPERATURE_SENSOR_PRESENT
+  if ! execute_with_retry $IDRAC_RETRY_COUNT $IDRAC_RETRY_DELAY "retrieve_temperatures $IS_EXHAUST_TEMPERATURE_SENSOR_PRESENT $IS_CPU2_TEMPERATURE_SENSOR_PRESENT"; then
+    print_warning "Failed to retrieve temperatures after $IDRAC_RETRY_COUNT retries, skipping this cycle"
+    wait $SLEEP_PROCESS_PID
+    continue
+  fi
 
   # Initialize a variable to store the comments displayed when the fan control profile changed
   COMMENT=" -"
-  # Check if CPU 1 is overheating then apply Dell default dynamic fan control profile if true
-  if CPU1_OVERHEATING; then
-    apply_Dell_default_fan_control_profile
 
+  # Calculate target fan speed based on highest CPU temperature
+  local max_cpu_temp=$CPU1_TEMPERATURE
+  if $IS_CPU2_TEMPERATURE_SENSOR_PRESENT && [ "$CPU2_TEMPERATURE" -gt "$max_cpu_temp" ]; then
+    max_cpu_temp=$CPU2_TEMPERATURE
+  fi
+
+  # Determine target speed based on temperature
+  if [ "$max_cpu_temp" -ge "$CPU_TEMPERATURE_THRESHOLD_MAX" ]; then
+    # Emergency: apply Dell default dynamic fan control
+    apply_Dell_default_fan_control_profile
     if ! $IS_DELL_DEFAULT_FAN_CONTROL_PROFILE_APPLIED; then
       IS_DELL_DEFAULT_FAN_CONTROL_PROFILE_APPLIED=true
-
-      # If CPU 2 temperature sensor is present, check if it is overheating too.
-      # Do not apply Dell default dynamic fan control profile as it has already been applied before
-      if $IS_CPU2_TEMPERATURE_SENSOR_PRESENT && CPU2_OVERHEATING; then
-        COMMENT="CPU 1 and CPU 2 temperatures are too high, Dell default dynamic fan control profile applied for safety"
-      else
-        COMMENT="CPU 1 temperature is too high, Dell default dynamic fan control profile applied for safety"
-      fi
+      COMMENT="CPU temperature reached max threshold ($CPU_TEMPERATURE_THRESHOLD_MAX°C), Dell default dynamic fan control applied for safety"
     fi
-  # If CPU 2 temperature sensor is present, check if it is overheating then apply Dell default dynamic fan control profile if true
-  elif $IS_CPU2_TEMPERATURE_SENSOR_PRESENT && CPU2_OVERHEATING; then
-    apply_Dell_default_fan_control_profile
-
-    if ! $IS_DELL_DEFAULT_FAN_CONTROL_PROFILE_APPLIED; then
-      IS_DELL_DEFAULT_FAN_CONTROL_PROFILE_APPLIED=true
-      COMMENT="CPU 2 temperature is too high, Dell default dynamic fan control profile applied for safety"
-    fi
-  elif [ $CPU1_TEMPERATURE -ge $CPU_TEMPERATURE_THRESHOLD ] || ($IS_CPU2_TEMPERATURE_SENSOR_PRESENT && [ $CPU2_TEMPERATURE -ge $CPU_TEMPERATURE_THRESHOLD ]); then
-    # Increase fan speed
-    CURRENT_FAN_SPEED=$(increase_fan_speed $FAN_SPEED_INCREASE_PERCENTAGE $CURRENT_FAN_SPEED)
-    apply_user_fan_control_profile $CURRENT_FAN_SPEED
-    COMMENT="CPU temperature above threshold, increasing fan speed to $CURRENT_FAN_SPEED%"
-  else
-    # Reset to default fan speed
-    CURRENT_FAN_SPEED=$DECIMAL_FAN_SPEED
+  elif [ "$max_cpu_temp" -ge "$CPU_TEMPERATURE_THRESHOLD" ]; then
+    # Within stepped range: calculate and apply target speed
+    local target_speed=$(calculate_target_fan_speed "$max_cpu_temp" "$CPU_TEMPERATURE_THRESHOLD" "$CPU_TEMPERATURE_THRESHOLD_MAX")
+    CURRENT_FAN_SPEED=$target_speed
     apply_user_fan_control_profile $CURRENT_FAN_SPEED
     if $IS_DELL_DEFAULT_FAN_CONTROL_PROFILE_APPLIED; then
       IS_DELL_DEFAULT_FAN_CONTROL_PROFILE_APPLIED=false
-      COMMENT="CPU temperature decreased and is now OK (<= $CPU_TEMPERATURE_THRESHOLD°C), user's fan control profile applied."
+      COMMENT="CPU temperature decreased, stepped fan control resumed at $CURRENT_FAN_SPEED%"
+    else
+      COMMENT="CPU temperature above threshold, fan speed set to $CURRENT_FAN_SPEED%"
     fi
+  else
+    # Below threshold: use base fan speed
+    if [ "$CURRENT_FAN_SPEED" != "$DECIMAL_FAN_SPEED" ]; then
+      CURRENT_FAN_SPEED=$DECIMAL_FAN_SPEED
+      apply_user_fan_control_profile $CURRENT_FAN_SPEED
+      COMMENT="CPU temperature OK (< $CPU_TEMPERATURE_THRESHOLD°C), fan speed returned to $CURRENT_FAN_SPEED%"
+    fi
+    IS_DELL_DEFAULT_FAN_CONTROL_PROFILE_APPLIED=false
   fi
 
   # If server model is not Gen 14 (*40) or newer
@@ -135,10 +146,10 @@ while true; do
     # Enable or disable, depending on the user's choice, third-party PCIe card Dell default cooling response
     # No comment will be displayed on the change of this parameter since it is not related to the temperature of any device (CPU, GPU, etc...) but only to the settings made by the user when launching this Docker container
     if "$DISABLE_THIRD_PARTY_PCIE_CARD_DELL_DEFAULT_COOLING_RESPONSE"; then
-      disable_third_party_PCIe_card_Dell_default_cooling_response
+      disable_third_party_PCIe_card_Dell_default_cooling_response || print_warning "Failed to disable third-party PCIe card cooling response"
       THIRD_PARTY_PCIE_CARD_DELL_DEFAULT_COOLING_RESPONSE_STATUS="Disabled"
     else
-      enable_third_party_PCIe_card_Dell_default_cooling_response
+      enable_third_party_PCIe_card_Dell_default_cooling_response || print_warning "Failed to enable third-party PCIe card cooling response"
       THIRD_PARTY_PCIE_CARD_DELL_DEFAULT_COOLING_RESPONSE_STATUS="Enabled"
     fi
   fi
